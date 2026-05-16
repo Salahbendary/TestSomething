@@ -6,6 +6,7 @@
 <title>VOIS EG Summer Service</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&display=swap');
 
@@ -1247,6 +1248,30 @@ body.screenshot-mode { background: #fff !important; padding: 0 !important; }
   .kat-remove-btn, .tt-bar-remove-btn { display: none !important; }
 }
 
+/* ── SUPABASE SYNC PANEL ── */
+.sync-panel {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: #111; border-radius: 6px; padding: 6px 10px;
+  margin-left: auto;
+}
+.sync-panel input {
+  background: #2a2a2a; border: 1px solid #444; color: #eee;
+  border-radius: 4px; padding: 4px 8px; font-size: 11px; width: 200px;
+}
+.sync-panel input::placeholder { color: #666; }
+.sync-panel input:focus { outline: none; border-color: #888; }
+.sync-dot {
+  width: 8px; height: 8px; border-radius: 50%; background: #444;
+  flex-shrink: 0; transition: background .3s;
+}
+.sync-dot.connected { background: #2fbf62; box-shadow: 0 0 6px #2fbf6288; }
+.sync-dot.error { background: #e53935; }
+.sync-label { color: #aaa; font-size: 11px; font-weight: 700; white-space: nowrap; }
+.sync-users { color: #7cb8ff; font-size: 11px; font-weight: 700; white-space: nowrap; }
+.sync-toggle { cursor: pointer; color: #888; font-size: 11px; user-select: none; }
+.sync-inputs { display: flex; gap: 6px; align-items: center; }
+.screenshot-mode .sync-panel { display: none !important; }
+
 </style>
 <body>
 
@@ -1257,6 +1282,19 @@ body.screenshot-mode { background: #fff !important; padding: 0 !important; }
   <span class="ctrl-title">📋 VOIS EG Summer Service Report Builder</span>
   <span class="ctrl-sep">|</span>
   <span class="ctrl-hint">Upload each technology's Excel sheet · Date &amp; Time editable · Comments editable</span>
+
+  <div class="sync-panel" id="syncPanel">
+    <div class="sync-dot" id="syncDot"></div>
+    <span class="sync-label" id="syncStatusLabel">Sync: Off</span>
+    <span class="sync-users" id="syncUsersLabel" style="display:none"></span>
+    <span class="sync-toggle" onclick="toggleSyncInputs()" title="Configure Supabase sync">⚙</span>
+    <div class="sync-inputs" id="syncInputs" style="display:none">
+      <input type="text" id="syncUrlInput" placeholder="Supabase Project URL" autocomplete="off">
+      <input type="password" id="syncKeyInput" placeholder="Supabase anon key" autocomplete="off">
+      <button class="ctrl-btn blue" onclick="connectSync()" style="padding:4px 10px;font-size:11px;">Connect</button>
+      <button class="ctrl-btn" onclick="disconnectSync()" style="padding:4px 10px;font-size:11px;background:#555;">Disconnect</button>
+    </div>
+  </div>
 </div>
 
 <!-- SCREENSHOT OVERLAY -->
@@ -2524,6 +2562,7 @@ function loadSheet(tech, input) {
 
       sheetData[tech] = parsed;
       sheetData[tech].window = file.name.replace(/\.[^.]+$/, '');
+      syncExcelData('main', tech, sheetData[tech]);
 
       renderTable(tech, rows);
       rebuildAreaDropdown();
@@ -3089,6 +3128,7 @@ function loadSheetMav(tech, input) {
       sheetDataMav[tech] = parsed;
       sheetDataMav[tech].window = file.name.replace(/\.[^.]+$/, '');
       sheetDataMav[tech].rawRows = rows;
+      syncExcelData('mav', tech, sheetDataMav[tech]);
       const hrs = sheetDataMav[tech]?.usedHours;
       statusEl.textContent = '✓ ' + file.name + (hrs && hrs !== 'all' ? ' · hours: ' + hrs : '');
       statusEl.className   = 'upload-status ok';
@@ -4450,6 +4490,7 @@ function loadSheetFiltered(tech, inputEl, store, prefix, filterAreas) {
       }
       store[tech] = parsed;
       store[tech].window = file.name.replace(/\.[^.]+$/, '');
+      syncExcelData(prefix, tech, store[tech]);
       fRenderTable(tech, store, filterAreas, prefix);
       fRenderAssurance(prefix, filterAreas, store);
       var hrs = store[tech] && store[tech].usedHours;
@@ -4638,6 +4679,255 @@ function fToggle(prefix, tech, vis) {
   var grid  = document.getElementById(prefix + 'TechGrid');
   if (grid) grid.className = 'tech-grid cols-' + count;
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SUPABASE REAL-TIME SYNC
+// ══════════════════════════════════════════════════════════════════════════════
+
+const SYNC_SESSION = Math.random().toString(36).slice(2, 10);
+let _sb = null;
+let _sbChannel = null;
+let _presenceChannel = null;
+let _remoteSyncing = false;
+const _debounceMap = {};
+const _LS_URL = 'sb_sync_url';
+const _LS_KEY = 'sb_sync_key';
+
+// ── Toggle credential inputs ──────────────────────────────────────────────────
+function toggleSyncInputs() {
+  const inp = document.getElementById('syncInputs');
+  const isHidden = inp.style.display === 'none';
+  inp.style.display = isHidden ? 'flex' : 'none';
+  if (isHidden) {
+    document.getElementById('syncUrlInput').value = localStorage.getItem(_LS_URL) || '';
+    document.getElementById('syncKeyInput').value = localStorage.getItem(_LS_KEY) || '';
+  }
+}
+
+// ── Connect ───────────────────────────────────────────────────────────────────
+async function connectSync() {
+  const url = document.getElementById('syncUrlInput').value.trim();
+  const key = document.getElementById('syncKeyInput').value.trim();
+  if (!url || !key) { alert('Enter both Supabase URL and anon key.'); return; }
+  localStorage.setItem(_LS_URL, url);
+  localStorage.setItem(_LS_KEY, key);
+  _setSyncStatus('connecting');
+  try {
+    _sb = supabase.createClient(url, key);
+    await _loadAllState();
+    _subscribeRealtime();
+    _subscribePresence();
+    _watchEditables();
+    document.getElementById('syncInputs').style.display = 'none';
+    _setSyncStatus('connected');
+  } catch(e) {
+    console.error('Sync connect error:', e);
+    _setSyncStatus('error');
+  }
+}
+
+function disconnectSync() {
+  if (_sbChannel) { _sb.removeChannel(_sbChannel); _sbChannel = null; }
+  if (_presenceChannel) { _sb.removeChannel(_presenceChannel); _presenceChannel = null; }
+  _sb = null;
+  _setSyncStatus('off');
+  document.getElementById('syncUsersLabel').style.display = 'none';
+}
+
+function _setSyncStatus(state) {
+  const dot = document.getElementById('syncDot');
+  const lbl = document.getElementById('syncStatusLabel');
+  dot.className = 'sync-dot';
+  if (state === 'connected')   { dot.classList.add('connected'); lbl.textContent = 'Sync: Live'; }
+  else if (state === 'connecting') { lbl.textContent = 'Sync: Connecting…'; }
+  else if (state === 'error')  { dot.classList.add('error'); lbl.textContent = 'Sync: Error'; }
+  else                         { lbl.textContent = 'Sync: Off'; }
+}
+
+// ── Load all state on connect ─────────────────────────────────────────────────
+async function _loadAllState() {
+  const { data, error } = await _sb.from('app_state').select('key,value');
+  if (error) { console.warn('Sync load error:', error); return; }
+  _remoteSyncing = true;
+  (data || []).forEach(row => _applyRow(row.key, row.value));
+  _remoteSyncing = false;
+}
+
+// ── Subscribe to Postgres Realtime changes ────────────────────────────────────
+function _subscribeRealtime() {
+  _sbChannel = _sb.channel('app_state_rt')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'app_state' }, payload => {
+      if (!payload.new) return;
+      if (payload.new.session_id === SYNC_SESSION) return;
+      _remoteSyncing = true;
+      _applyRow(payload.new.key, payload.new.value);
+      _remoteSyncing = false;
+    })
+    .subscribe();
+}
+
+// ── Presence: count online users ──────────────────────────────────────────────
+function _subscribePresence() {
+  _presenceChannel = _sb.channel('presence_room', { config: { presence: { key: SYNC_SESSION } } });
+  _presenceChannel.on('presence', { event: 'sync' }, () => {
+    const state = _presenceChannel.presenceState();
+    const count = Object.keys(state).length;
+    const ul = document.getElementById('syncUsersLabel');
+    ul.style.display = count > 1 ? 'inline' : 'none';
+    ul.textContent = count + ' online';
+  }).subscribe(async status => {
+    if (status === 'SUBSCRIBED') {
+      await _presenceChannel.track({ session: SYNC_SESSION, t: Date.now() });
+    }
+  });
+}
+
+// ── Apply one row to the DOM or data stores ───────────────────────────────────
+function _applyRow(key, value) {
+  if (!key || value === null || value === undefined) return;
+  if (key.startsWith('field:')) {
+    const id = key.slice(6);
+    const el = document.getElementById(id);
+    if (el && el.isContentEditable && el.innerHTML !== value) {
+      const sel = document.getSelection();
+      const hasFocus = (document.activeElement === el);
+      if (!hasFocus) el.innerHTML = value;
+    }
+  } else if (key.startsWith('excel:')) {
+    const parts = key.split(':');
+    const store = parts[1], tech = parts[2];
+    try {
+      const parsed = JSON.parse(value);
+      _applyExcelData(store, tech, parsed);
+    } catch(e) { console.warn('Sync parse error for', key, e); }
+  }
+}
+
+// ── Apply remote Excel data ───────────────────────────────────────────────────
+function _applyExcelData(store, tech, parsed) {
+  const stKey = { main: 'st', mav: 'mavSt', mr: 'mrSt', ma: 'maSt' }[store] || (store + 'St');
+  const stEl = document.getElementById(stKey + tech);
+  switch (store) {
+    case 'main':
+      sheetData[tech] = parsed;
+      _renderTableFromParsed(tech, parsed);
+      rebuildAreaDropdown();
+      renderAssuranceDashboard();
+      renderSingleArea();
+      if (stEl) { stEl.textContent = '✓ (synced from team)'; stEl.className = 'upload-status ok'; }
+      break;
+    case 'mav':
+      sheetDataMav[tech] = parsed;
+      mavRebuildAreaCheckboxes();
+      renderMavView();
+      if (stEl) { stEl.textContent = '✓ (synced from team)'; stEl.className = 'upload-status ok'; }
+      break;
+    case 'mr':
+      sheetDataMr[tech] = parsed;
+      fRenderTable(tech, sheetDataMr, MAIN_ROADS_AREAS, 'mr');
+      fRenderAssurance('mr', MAIN_ROADS_AREAS, sheetDataMr);
+      if (stEl) { stEl.textContent = '✓ (synced from team)'; stEl.className = 'upload-status ok'; }
+      break;
+    case 'ma':
+      sheetDataMa[tech] = parsed;
+      fRenderTable(tech, sheetDataMa, MAIN_AREAS_AREAS, 'ma');
+      fRenderAssurance('ma', MAIN_AREAS_AREAS, sheetDataMa);
+      if (stEl) { stEl.textContent = '✓ (synced from team)'; stEl.className = 'upload-status ok'; }
+      break;
+  }
+}
+
+// ── Render a KPI table from pre-parsed data (no raw rows needed) ──────────────
+function _renderTableFromParsed(tech, parsed) {
+  const container = document.getElementById('tbl' + tech);
+  if (!container) return;
+  if (!parsed) { container.innerHTML = '<div class="kpi-empty">No data found</div>'; return; }
+  const { kpiNames, areas: areaMap } = parsed;
+  const groupOrder = Object.keys(areaMap || {});
+  if (!groupOrder.length) { container.innerHTML = '<div class="kpi-empty">No group rows found.</div>'; return; }
+  const displayOrder = [], displayMap = {};
+  groupOrder.forEach(rawName => {
+    const dispName = (typeof AREA_NAME_MAP !== 'undefined' && AREA_NAME_MAP[tech] && AREA_NAME_MAP[tech][rawName])
+      ? AREA_NAME_MAP[tech][rawName] : rawName;
+    if (!displayMap[dispName]) { displayOrder.push(dispName); displayMap[dispName] = { rows: [] }; }
+    displayMap[dispName].rows.push(areaMap[rawName]);
+  });
+  displayOrder.sort((a, b) => {
+    const ai = CANONICAL_AREA_ORDER.indexOf(a), bi = CANONICAL_AREA_ORDER.indexOf(b);
+    if (ai === -1 && bi === -1) return a.localeCompare(b);
+    if (ai === -1) return 1; if (bi === -1) return -1;
+    return ai - bi;
+  });
+  const mergedAreas = {};
+  displayOrder.forEach(disp => {
+    const allRows = displayMap[disp].rows;
+    mergedAreas[disp] = (kpiNames || []).map((_, ki) => {
+      const nums = allRows.map(r => parseFloat(r[ki])).filter(v => !isNaN(v));
+      if (!nums.length) return '—';
+      const avg = nums.reduce((s, v) => s + v, 0) / nums.length;
+      return Number.isInteger(avg) ? String(avg) : avg.toFixed(2);
+    });
+  });
+  displayOrder.forEach(g => getAreaPalette(g));
+  let html = '<table class="kpi-table tbl-' + tech.toLowerCase() + '"><thead><tr>';
+  html += '<th class="kpi-col-hdr">KPI / Area</th>';
+  displayOrder.forEach(g => { html += `<th class="area-hdr">${escHtml(g)}</th>`; });
+  html += '</tr></thead><tbody>';
+  (kpiNames || []).forEach((kpi, ki) => {
+    const displayKpi = (typeof KPI_DISPLAY_NAME !== 'undefined' && KPI_DISPLAY_NAME[kpi.trim()]) || kpi;
+    html += '<tr><td class="kpi-name">' + escHtml(displayKpi) + '</td>';
+    displayOrder.forEach(g => {
+      const val = mergedAreas[g][ki] || '—';
+      const cls = getValClassByThreshold(tech, kpi, val);
+      html += `<td class="kpi-val ${cls}">${escHtml(val)}</td>`;
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+// ── Watch all contenteditable elements for changes ────────────────────────────
+function _watchEditables() {
+  document.querySelectorAll('[contenteditable]').forEach(el => {
+    if (!el.id) return;
+    el.addEventListener('input', () => {
+      if (_remoteSyncing) return;
+      clearTimeout(_debounceMap[el.id]);
+      _debounceMap[el.id] = setTimeout(() => _pushField(el.id, el.innerHTML), 600);
+    });
+  });
+}
+
+// ── Push a field value to Supabase ────────────────────────────────────────────
+async function _pushField(id, value) {
+  if (!_sb) return;
+  await _sb.from('app_state').upsert({ key: 'field:' + id, value, session_id: SYNC_SESSION, updated_at: new Date().toISOString() });
+}
+
+// ── Push Excel data to Supabase ───────────────────────────────────────────────
+async function syncExcelData(store, tech, parsed) {
+  if (!_sb) return;
+  const toSync = Object.assign({}, parsed);
+  delete toSync.rawRows;
+  await _sb.from('app_state').upsert({
+    key: 'excel:' + store + ':' + tech,
+    value: JSON.stringify(toSync),
+    session_id: SYNC_SESSION,
+    updated_at: new Date().toISOString()
+  });
+}
+
+// ── Auto-reconnect from localStorage on page load ─────────────────────────────
+window.addEventListener('DOMContentLoaded', function() {
+  const url = localStorage.getItem(_LS_URL);
+  const key = localStorage.getItem(_LS_KEY);
+  if (url && key) {
+    document.getElementById('syncUrlInput').value = url;
+    document.getElementById('syncKeyInput').value = key;
+    connectSync();
+  }
+});
 
 /* ── Init: date/time and logo cloning ── */
 window.addEventListener('DOMContentLoaded', function() {
