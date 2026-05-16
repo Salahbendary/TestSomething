@@ -1,12 +1,10 @@
 FROM nginx:alpine
 
-# Remove default nginx page
 RUN rm -rf /usr/share/nginx/html/*
 
-# Copy your HTML file
-COPY html/ /usr/share/nginx/html/
+# ✅ Copy from root directly
+COPY VOIS_EG_Summer_Service_V0__.html /usr/share/nginx/html/
 
-# Copy custom nginx config
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
 EXPOSE 80
